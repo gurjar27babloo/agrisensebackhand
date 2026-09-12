@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AquaSense — Live Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #0d3817 0%, #1b5e20 100%);
+    min-height: 100vh;
+    padding: 24px;
+    color: #222;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  header { text-align:center; color:#fff; margin-bottom: 28px; }
+  header h1 { font-size: 30px; margin-bottom: 4px; }
+  header p { opacity: 0.85; font-size: 14px; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: #fff;
+    border-radius: 12px;
+    padding: 18px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.12);
+  }
+  .card .label { font-size: 12px; color:#777; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px;}
+  .card .value { font-size: 28px; font-weight:700; color:#1b5e20; }
+  .card .sub { font-size: 12px; color:#999; margin-top:4px; }
+
+  .status-pill {
+    display:inline-block; padding: 4px 12px; border-radius: 20px;
+    font-size: 13px; font-weight:600;
+  }
+  .status-on { background:#e6f4ea; color:#1b5e20; }
+  .status-off { background:#fdecea; color:#a13a2c; }
+
+  .panel {
+    background:#fff; border-radius:12px; padding:20px; margin-bottom:20px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.12);
+  }
+  .panel h2 { font-size:16px; margin-bottom:14px; color:#1b5e20; }
+  canvas { max-height: 320px; }
+
+  table { width:100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align:left; padding: 8px 10px; border-bottom: 1px solid #eee; }
+  th { color:#777; font-weight:600; text-transform:uppercase; font-size:11px; }
+  tr:hover { background:#fafafa; }
+
+  .empty-state { text-align:center; padding: 40px 20px; color:#888; }
+  .refresh-note { text-align:center; color:rgba(255,255,255,0.7); font-size:12px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>🌾 AquaSense Live Dashboard</h1>
+    <p>Real-time sensor data and irrigation decisions from the field</p>
+  </header>
+
+  <div class="grid" id="statCards">
+    <div class="card"><div class="label">Soil Moisture</div><div class="value" id="v-soil">—</div></div>
+    <div class="card"><div class="label">Temperature</div><div class="value" id="v-temp">—</div></div>
+    <div class="card"><div class="label">Humidity</div><div class="value" id="v-hum">—</div></div>
+    <div class="card"><div class="label">Rain Forecast</div><div class="value" id="v-rain">—</div></div>
+    <div class="card"><div class="label">Pump Status</div><div class="value" id="v-pump">—</div></div>
+    <div class="card"><div class="label">Est. Water Used</div><div class="value" id="v-liters">—</div><div class="sub">across all logged events</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Sensor Trend (Last Readings)</h2>
+    <canvas id="trendChart"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2>Recent Irrigation Events</h2>
+    <div id="tableWrap">
+      <div class="empty-state">Loading history…</div>
+    </div>
+  </div>
+
+  <p class="refresh-note">Auto-refreshing every 15 seconds · Data from /api/history</p>
+</div>
+
+<script>
+let chart;
+
+async function fetchHistory() {
+  try {
+    const res = await fetch('/api/history?limit=50');
+    if (!res.ok) throw new Error('Request failed: ' + res.status);
+    const data = await res.json();
+    render(data);
+  } catch (err) {
+    console.error('Failed to load history:', err);
+    document.getElementById('tableWrap').innerHTML =
+      '<div class="empty-state">Could not load data — is the backend reachable?</div>';
+  }
+}
+
+function render(data) {
+  const latest = data.latest;
+  const readings = data.readings || [];
+
+  if (latest) {
+    document.getElementById('v-soil').textContent = latest.soil_moisture.toFixed(0) + '%';
+    document.getElementById('v-temp').textContent = latest.temperature.toFixed(1) + '°C';
+    document.getElementById('v-hum').textContent = latest.humidity.toFixed(0) + '%';
+    document.getElementById('v-rain').textContent = latest.rain_forecast_mm.toFixed(1) + 'mm';
+
+    const pumpEl = document.getElementById('v-pump');
+    if (latest.irrigate) {
+      pumpEl.innerHTML = '<span class="status-pill status-on">RUNNING</span>';
+    } else {
+      pumpEl.innerHTML = '<span class="status-pill status-off">IDLE</span>';
+    }
+  } else {
+    document.getElementById('tableWrap').innerHTML =
+      '<div class="empty-state">No readings yet — waiting for the first ESP32 cycle to report in.</div>';
+  }
+
+  document.getElementById('v-liters').textContent =
+    (data.summary ? data.summary.estimated_liters_used : 0) + ' L';
+
+  // Chart
+  const labels = readings.map(r => new Date(r.timestamp).toLocaleTimeString());
+  const soilData = readings.map(r => r.soil_moisture);
+  const tempData = readings.map(r => r.temperature);
+  const humData = readings.map(r => r.humidity);
+
+  if (!chart) {
+    const ctx = document.getElementById('trendChart').getContext('2d');
+    chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          { label: 'Soil Moisture %', data: soilData, borderColor: '#8B4513', tension: 0.3 },
+          { label: 'Temperature °C', data: tempData, borderColor: '#FF6F00', tension: 0.3 },
+          { label: 'Humidity %', data: humData, borderColor: '#1976D2', tension: 0.3 },
+        ]
+      },
+      options: { responsive: true, plugins: { legend: { position: 'top' } } }
+    });
+  } else {
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = soilData;
+    chart.data.datasets[1].data = tempData;
+    chart.data.datasets[2].data = humData;
+    chart.update();
+  }
+
+  // Table — most recent first
+  if (readings.length > 0) {
+    const rows = [...readings].reverse().slice(0, 20).map(r => `
+      <tr>
+        <td>${new Date(r.timestamp).toLocaleString()}</td>
+        <td>${r.soil_moisture.toFixed(0)}%</td>
+        <td>${r.temperature.toFixed(1)}°C</td>
+        <td>${r.crop_type}</td>
+        <td>${r.irrigate ? '💧 Yes' : '— No'}</td>
+        <td>${r.power_level.toFixed(0)}%</td>
+        <td style="max-width:280px;">${r.reason}</td>
+      </tr>
+    `).join('');
+
+    document.getElementById('tableWrap').innerHTML = `
+      <table>
+        <thead><tr>
+          <th>Time</th><th>Soil</th><th>Temp</th><th>Crop</th><th>Irrigated</th><th>Power</th><th>Reason</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  }
+}
+
+fetchHistory();
+setInterval(fetchHistory, 15000);
+</script>
+</body>
+</html>
